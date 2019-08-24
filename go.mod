@@ -1,4 +1,4 @@
-module github.org/mingfu/twofactor
+module github.org/mingfudesign/twofactor
 
 go 1.12
 
