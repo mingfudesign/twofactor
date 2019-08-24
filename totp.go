@@ -25,6 +25,16 @@ import (
 	qr "github.com/sec51/qrcode"
 )
 
+type Config struct {
+	BackoffMinutes time.Duration `json:"backOffMinutes"` // this is the time to wait before verifying another token
+	MaxFailures    int           `json:"maxFailures"`    // total amount of failures, after that the user needs to wait for the backoff time
+}
+
+var DefaultConfig = &Config{
+	BackoffMinutes: backoff_minutes,
+	MaxFailures:    max_failures,
+}
+
 const (
 	backoff_minutes = 5 // this is the time to wait before verifying another token
 	max_failures    = 3 // total amount of failures, after that the user needs to wait for the backoff time
@@ -33,8 +43,9 @@ const (
 )
 
 var (
-	initializationFailedError = errors.New("Totp has not been initialized correctly")
-	LockDownError             = errors.New("The verification is locked down, because of too many trials.")
+	initializationFailedError = errors.New("totp has not been initialized correctly")
+	LockDownError             = errors.New("totp is locked down due to too many failed verification attempts")
+	TokenMismatchError        = errors.New("tokens mismatch")
 )
 
 // WARNING: The `Totp` struct should never be instantiated manually!
@@ -76,12 +87,10 @@ func (otp *Totp) getIntCounter() uint64 {
 // issuer: the name of the company/service
 // hash: is the crypto function used: crypto.SHA1, crypto.SHA256, crypto.SHA512
 // digits: is the token amount of digits (6 or 7 or 8)
-// steps: the amount of second the token is valid
 // it automatically generates a secret key using the golang crypto rand package. If there is not enough entropy the function returns an error
 // The key is not encrypted in this package. It's a secret key. Therefore if you transfer the key bytes in the network,
 // please take care of protecting the key or in fact all the bytes.
 func NewTOTP(account, issuer string, hash crypto.Hash, digits int) (*Totp, error) {
-
 	keySize := hash.Size()
 	key := make([]byte, keySize)
 	total, err := rand.Read(key)
@@ -121,24 +130,27 @@ func makeTOTP(key []byte, account, issuer string, hash crypto.Hash, digits int) 
 // There is a very basic method which protects from timing attacks, although if the step time used is low it should not be necessary
 // An attacker can still learn the synchronization offset. This is however irrelevant because the attacker has then 30 seconds to
 // guess the code and after 3 failures the function returns an error for the following 5 minutes
-func (otp *Totp) Validate(userCode string) error {
-
+func (otp *Totp) Validate(userCode string, config *Config) error {
 	// check Totp initialization
 	if err := totpHasBeenInitialized(otp); err != nil {
 		return err
 	}
 
+	if config == nil {
+		return errors.New("config is nil")
+	}
+
 	// verify that the token is valid
 	if userCode == "" {
-		return errors.New("User provided token is empty")
+		return errors.New("user provided token is empty")
 	}
 
 	// check against the total amount of failures
-	if otp.totalVerificationFailures >= max_failures && !validBackoffTime(otp.lastVerificationTime) {
+	if otp.totalVerificationFailures >= config.MaxFailures && !validBackoffTime(otp.lastVerificationTime, config.BackoffMinutes) {
 		return LockDownError
 	}
 
-	if otp.totalVerificationFailures >= max_failures && validBackoffTime(otp.lastVerificationTime) {
+	if otp.totalVerificationFailures >= config.MaxFailures && validBackoffTime(otp.lastVerificationTime, config.BackoffMinutes) {
 		// reset the total verification failures counter
 		otp.totalVerificationFailures = 0
 	}
@@ -178,13 +190,13 @@ func (otp *Totp) Validate(userCode string) error {
 	otp.lastVerificationTime = time.Now().UTC() // important to have it in UTC
 
 	// if we got here everything is good
-	return errors.New("Tokens mismatch.")
+	return TokenMismatchError
 }
 
 // Checks the time difference between the function call time and the parameter
 // if the difference of time is greater than BACKOFF_MINUTES  it returns true, otherwise false
-func validBackoffTime(lastVerification time.Time) bool {
-	diff := lastVerification.UTC().Add(backoff_minutes * time.Minute)
+func validBackoffTime(lastVerification time.Time, backOffMinutes time.Duration) bool {
+	diff := lastVerification.UTC().Add(backOffMinutes * time.Minute)
 	return time.Now().UTC().After(diff)
 }
 
@@ -288,7 +300,7 @@ func (otp *Totp) url() (string, error) {
 		return "", err
 	}
 
-	secret := base32.StdEncoding.EncodeToString(otp.key)
+	secret := otp.Secret()
 	u := url.URL{}
 	v := url.Values{}
 	u.Scheme = "otpauth"
